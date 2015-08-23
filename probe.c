@@ -58,7 +58,7 @@ static struct proto builtins[] = {
 };
 
 static struct proto *protocols;
-static char* on_timeout = "telnet";
+static char* on_timeout = "ssh1";
 
 struct proto*  get_builtins(void) {
     return builtins;
