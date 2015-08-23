@@ -27,30 +27,36 @@
 
 
 
-static int is_ssh_protocol(const char *p, int len, struct proto*);
+static int is_ssh1_protocol(const char *p, int len, struct proto*);
+static int is_ssh2_protocol(const char *p, int len, struct proto*);
 static int is_openvpn_protocol(const char *p, int len, struct proto*);
 static int is_tinc_protocol(const char *p, int len, struct proto*);
 static int is_xmpp_protocol(const char *p, int len, struct proto*);
 static int is_http_protocol(const char *p, int len, struct proto*);
 static int is_tls_protocol(const char *p, int len, struct proto*);
+static int is_telnet_protocol(const char *p, int len, struct proto*);
 static int is_true(const char *p, int len, struct proto* proto) { return 1; }
 
 /* Table of protocols that have a built-in probe
  */
 static struct proto builtins[] = {
     /* description   service  saddr   probe  */
-    { "ssh",         "sshd",   NULL,   is_ssh_protocol},
+    { "ssh1",        NULL,   NULL,   is_ssh1_protocol},
+    { "ssh2",        NULL,   NULL,   is_ssh2_protocol},
+    { "telnet",      NULL,   NULL,   is_telnet_protocol},
+#if 0
     { "openvpn",     NULL,     NULL,   is_openvpn_protocol },
     { "tinc",        NULL,     NULL,   is_tinc_protocol },
     { "xmpp",        NULL,     NULL,   is_xmpp_protocol },
     { "http",        NULL,     NULL,   is_http_protocol },
     { "ssl",         NULL,     NULL,   is_tls_protocol },
     { "tls",         NULL,     NULL,   is_tls_protocol },
+#endif
     { "anyprot",     NULL,     NULL,   is_true }
 };
 
 static struct proto *protocols;
-static char* on_timeout = "ssh";
+static char* on_timeout = "telnet";
 
 struct proto*  get_builtins(void) {
     return builtins;
@@ -123,12 +129,27 @@ void hexdump(const char *mem, unsigned int len)
 }
 
 /* Is the buffer the beginning of an SSH connection? */
-static int is_ssh_protocol(const char *p, int len, struct proto *proto)
+static int is_ssh1_protocol(const char *p, int len, struct proto *proto)
 {
-    if (len < 4)
+    if (len < 5)
         return PROBE_AGAIN;
 
-    return !strncmp(p, "SSH-", 4);
+    return !strncmp(p, "SSH-1", 5);
+}
+
+static int is_ssh2_protocol(const char *p, int len, struct proto *proto)
+{
+    if (len < 5)
+        return PROBE_AGAIN;
+
+    return !strncmp(p, "SSH-2", 5);
+}
+static int is_telnet_protocol(const char *p, int len, struct proto *proto)
+{
+    if (len < 2)
+        return PROBE_AGAIN;
+
+    return (*p==0xff)&&(*(p+1)!=0xff);
 }
 
 /* Is the buffer the beginning of an OpenVPN connection?
