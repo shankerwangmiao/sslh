@@ -25,7 +25,9 @@
 #ifdef LIBCONFIG
 #include <libconfig.h>
 #endif
+#ifdef LIBPCRE
 #include <regex.h>
+#endif
 
 #include "common.h"
 #include "probe.h"
@@ -174,6 +176,7 @@ static int config_listen(config_t *config, struct addrinfo **listen)
 #ifdef LIBCONFIG
 static void setup_regex_probe(struct proto *p, config_setting_t* probes)
 {
+#ifdef LIBPCRE
     int num_probes, errsize, i, res;
     char *err;
     const char * expr;
@@ -201,6 +204,42 @@ static void setup_regex_probe(struct proto *p, config_setting_t* probes)
             exit(1);
         }
     }
+#else
+    fprintf(stderr, "line %d: regex probe specified but not compiled in\n", config_setting_source_line(probes));
+    exit(5);
+#endif
+}
+#endif
+
+#ifdef LIBCONFIG
+static void setup_sni_hostnames(struct proto *p, config_setting_t* sni_hostnames)
+{
+    int num_probes, i, max_server_name_len, server_name_len;
+    const char * sni_hostname;
+    char** sni_hostname_list;
+
+    num_probes = config_setting_length(sni_hostnames);
+    if (!num_probes) {
+        fprintf(stderr, "%s: no sni_hostnames specified\n", p->description);
+        exit(1);
+    }
+
+    max_server_name_len = 0;
+    for (i = 0; i < num_probes; i++) {
+        server_name_len = strlen(config_setting_get_string_elem(sni_hostnames, i));
+        if(server_name_len > max_server_name_len)
+            max_server_name_len = server_name_len;
+    }
+
+    sni_hostname_list = calloc(num_probes + 1, ++max_server_name_len);
+    p->data = (void*)sni_hostname_list;
+
+    for (i = 0; i < num_probes; i++) {
+        sni_hostname = config_setting_get_string_elem(sni_hostnames, i);
+        sni_hostname_list[i] = malloc(max_server_name_len);
+        strcpy (sni_hostname_list[i], sni_hostname);
+        if(verbose) fprintf(stderr, "sni_hostnames[%d]: %s\n", i, sni_hostname_list[i]);
+    }
 }
 #endif
 
@@ -210,7 +249,7 @@ static void setup_regex_probe(struct proto *p, config_setting_t* probes)
 #ifdef LIBCONFIG
 static int config_protocols(config_t *config, struct proto **prots)
 {
-    config_setting_t *setting, *prot, *probes;
+    config_setting_t *setting, *prot, *patterns, *sni_hostnames;
     const char *hostname, *port, *name;
     int i, num_prots;
     struct proto *p, *prev = NULL;
@@ -234,28 +273,25 @@ static int config_protocols(config_t *config, struct proto **prots)
 
                 resolve_split_name(&(p->saddr), hostname, port);
 
+                p->probe = get_probe(name);
+                if (!p->probe) {
+                    fprintf(stderr, "line %d: %s: probe unknown\n", config_setting_source_line(prot), name);
+                    exit(1);
+                }
 
-                probes = config_setting_get_member(prot, "probe");
-                if (probes) {
-                    if (config_setting_is_array(probes)) {
-                        /* If 'probe' is an array, setup a regex probe using the
-                         * array of strings as pattern */
+                /* Probe-specific options: regex patterns */
+                if (!strcmp(name, "regex")) {
+                    patterns = config_setting_get_member(prot, "regex_patterns");
+                    if (patterns && config_setting_is_array(patterns)) {
+                        setup_regex_probe(p, patterns);
+                    }
+                }
 
-                        setup_regex_probe(p, probes);
-
-                    } else {
-                        /* if 'probe' is 'builtin', set the probe to the
-                         * appropriate builtin protocol */
-                        if (!strcmp(config_setting_get_string(probes), "builtin")) {
-                            p->probe = get_probe(name);
-                            if (!p->probe) {
-                                fprintf(stderr, "%s: no builtin probe for this protocol\n", name);
-                                exit(1);
-                            }
-                        } else {
-                            fprintf(stderr, "%s: illegal probe name\n", name);
-                            exit(1);
-                        }
+                /* Probe-specific options: SNI hostnames */
+                if (!strcmp(name, "sni")) {
+                    sni_hostnames = config_setting_get_member(prot, "sni_hostnames");
+                    if (sni_hostnames && config_setting_is_array(sni_hostnames)) {
+                        setup_sni_hostnames(p, sni_hostnames);
                     }
                 }
             }
@@ -270,6 +306,7 @@ static int config_protocols(config_t *config, struct proto **prots)
  * in: *filename
  * out: *listen, a newly-allocated linked list of listen addrinfo
  *      *prots, a newly-allocated linked list of protocols
+ *      1 on error, 0 on success
  */
 #ifdef LIBCONFIG
 static int config_parse(char *filename, struct addrinfo **listen, struct proto **prots)
@@ -280,13 +317,19 @@ static int config_parse(char *filename, struct addrinfo **listen, struct proto *
 
     config_init(&config);
     if (config_read_file(&config, filename) == CONFIG_FALSE) {
-        if (config_error_type(&config) == CONFIG_ERR_PARSE) {
+        /* If it's a parse error then there will be a line number for the failure
+         * an I/O error (such as non-existent file) will have the error line as 0
+         */
+        if (config_error_line(&config) != 0) {
             fprintf(stderr, "%s:%d:%s\n", 
                     filename,
                     config_error_line(&config),
                     config_error_text(&config));
             exit(1);
         }
+        fprintf(stderr, "%s:%s\n", 
+                filename,
+                config_error_text(&config));
         return 1;
     }
 
@@ -363,10 +406,12 @@ static void cmdline_config(int argc, char* argv[], struct proto** prots)
     optind = 1;
     opterr = 0; /* we're missing protocol options at this stage so don't output errors */
     while ((c = getopt_long_only(argc, argv, optstr, all_options, NULL)) != -1) {
+        if (c == 'v') {
+            verbose++;
+        }
         if (c == 'F') {
             config_filename = optarg;
             if (config_filename) {
-                fprintf(stderr, "config: %s\n", config_filename);
                 res = config_parse(config_filename, &addr_listen, prots);
             } else {
                 /* No configuration file specified -- try default file locations */

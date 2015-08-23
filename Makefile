@@ -2,10 +2,13 @@
 
 VERSION=$(shell ./genver.sh -r)
 USELIBCONFIG=1	# Use libconfig? (necessary to use configuration files)
+USELIBPCRE=1	# Use libpcre? (necessary to use regex probe)
 USELIBWRAP?=	# Use libwrap?
 USELIBCAP=	# Use libcap?
 COV_TEST= 	# Perform test coverage?
-PREFIX=/usr/local
+PREFIX?=/usr
+BINDIR?=$(PREFIX)/sbin
+MANDIR?=$(PREFIX)/share/man/man8
 
 MAN=sslh.8.gz	# man page name
 
@@ -20,11 +23,15 @@ CC ?= gcc
 CFLAGS ?=-Wall -g $(CFLAGS_COV)
 
 LIBS=
-OBJS=common.o sslh-main.o probe.o
+OBJS=common.o sslh-main.o probe.o tls.o
 
 ifneq ($(strip $(USELIBWRAP)),)
 	LIBS:=$(LIBS) -lwrap
 	CPPFLAGS+=-DLIBWRAP
+endif
+
+ifneq ($(strip $(USELIBPCRE)),)
+	CPPFLAGS+=-DLIBPCRE
 endif
 
 ifneq ($(strip $(USELIBCONFIG)),)
@@ -56,7 +63,7 @@ sslh-select: version.h $(OBJS) sslh-select.o Makefile common.h
 	#strip sslh-select
 
 echosrv: $(OBJS) echosrv.o
-	$(CC) $(CFLAGS) $(LDFLAGS) -o echosrv echosrv.o probe.o common.o $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o echosrv echosrv.o probe.o common.o tls.o $(LIBS)
 
 $(MAN): sslh.pod Makefile
 	pod2man --section=8 --release=$(VERSION) --center=" " sslh.pod | gzip -9 - > $(MAN)
@@ -68,8 +75,10 @@ release:
 
 # generic install: install binary and man page
 install: sslh $(MAN)
-	install -pD sslh-fork $(DESTDIR)$(PREFIX)/sbin/sslh
-	install -pD -m 0644 $(MAN) $(DESTDIR)$(PREFIX)/share/man/man8/$(MAN)
+	mkdir -p $(DESTDIR)/$(BINDIR)
+	mkdir -p $(DESTDIR)/$(MANDIR)
+	install -p sslh-fork $(DESTDIR)/$(BINDIR)/sslh
+	install -p -m 0644 $(MAN) $(DESTDIR)/$(MANDIR)/$(MAN)
 
 # "extended" install for Debian: install startup script
 install-debian: install sslh $(MAN)
@@ -78,7 +87,7 @@ install-debian: install sslh $(MAN)
 	update-rc.d sslh defaults
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/sbin/sslh $(DESTDIR)$(PREFIX)/share/man/man8/$(MAN) $(DESTDIR)/etc/init.d/sslh $(DESTDIR)/etc/default/sslh
+	rm -f $(DESTDIR)$(BINDIR)/sslh $(DESTDIR)$(MANDIR)/$(MAN) $(DESTDIR)/etc/init.d/sslh $(DESTDIR)/etc/default/sslh
 	update-rc.d sslh remove
 
 distclean: clean
@@ -96,4 +105,3 @@ cscope:
 
 test:
 	./t
-

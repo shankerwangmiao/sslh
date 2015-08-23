@@ -1,7 +1,7 @@
 /*
 # probe.c: Code for probing protocols
 #
-# Copyright (C) 2007-2012  Yves Rutschle
+# Copyright (C) 2007-2015  Yves Rutschle
 # 
 # This program is free software; you can redistribute it
 # and/or modify it under the terms of the GNU General Public
@@ -21,7 +21,9 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#ifdef LIBPCRE
 #include <regex.h>
+#endif
 #include <ctype.h>
 #include "probe.h"
 
@@ -35,6 +37,7 @@ static int is_xmpp_protocol(const char *p, int len, struct proto*);
 static int is_http_protocol(const char *p, int len, struct proto*);
 static int is_tls_protocol(const char *p, int len, struct proto*);
 static int is_telnet_protocol(const char *p, int len, struct proto*);
+static int is_adb_protocol(const char *p, int len, struct proto*);
 static int is_true(const char *p, int len, struct proto* proto) { return 1; }
 
 /* Table of protocols that have a built-in probe
@@ -44,14 +47,13 @@ static struct proto builtins[] = {
     { "ssh1",        NULL,   NULL,   is_ssh1_protocol},
     { "ssh2",        NULL,   NULL,   is_ssh2_protocol},
     { "telnet",      NULL,   NULL,   is_telnet_protocol},
-#if 0
     { "openvpn",     NULL,     NULL,   is_openvpn_protocol },
     { "tinc",        NULL,     NULL,   is_tinc_protocol },
     { "xmpp",        NULL,     NULL,   is_xmpp_protocol },
     { "http",        NULL,     NULL,   is_http_protocol },
     { "ssl",         NULL,     NULL,   is_tls_protocol },
     { "tls",         NULL,     NULL,   is_tls_protocol },
-#endif
+    { "adb",         NULL,     NULL,   is_adb_protocol },
     { "anyprot",     NULL,     NULL,   is_true }
 };
 
@@ -174,7 +176,8 @@ static int is_openvpn_protocol (const char*p,int len, struct proto *proto)
 }
 
 /* Is the buffer the beginning of a tinc connections?
- * (protocol is undocumented, but starts with "0 " in 1.0.15)
+ * Protocol is documented here: http://www.tinc-vpn.org/documentation/tinc.pdf
+ * First connection starts with "0 " in 1.0.15)
  * */
 static int is_tinc_protocol( const char *p, int len, struct proto *proto)
 {
@@ -233,6 +236,34 @@ static int is_http_protocol(const char *p, int len, struct proto *proto)
     return PROBE_NEXT;
 }
 
+static int is_sni_protocol(const char *p, int len, struct proto *proto)
+{
+    int valid_tls;
+    char *hostname;
+    char **sni_hostname;
+
+    valid_tls = parse_tls_header(p, len, &hostname);
+
+    if(valid_tls < 0)
+        return -1 == valid_tls ? PROBE_AGAIN : PROBE_NEXT;
+
+    if (verbose) fprintf(stderr, "sni hostname: %s\n", hostname);
+
+    /* Assume does not match */
+    valid_tls = PROBE_NEXT;
+
+    for (sni_hostname = proto->data; *sni_hostname; sni_hostname++) {
+        fprintf(stderr, "matching [%s] with [%s]\n", hostname, *sni_hostname);
+        if(!strcmp(hostname, *sni_hostname)) {
+            valid_tls = PROBE_MATCH;
+            break;
+        }
+    }
+
+    free(hostname);
+    return valid_tls;
+}
+
 static int is_tls_protocol(const char *p, int len, struct proto *proto)
 {
     if (len < 3)
@@ -245,8 +276,25 @@ static int is_tls_protocol(const char *p, int len, struct proto *proto)
     return p[0] == 0x16 && p[1] == 0x03 && ( p[2] >= 0 && p[2] <= 0x03);
 }
 
+static int is_adb_protocol(const char *p, int len, struct proto *proto)
+{
+    if (len < 30)
+        return PROBE_AGAIN;
+
+    /* The initial ADB host->device packet has a command type of CNXN, and a
+     * data payload starting with "host:".  Note that current versions of the
+     * client hardcode "host::" (with empty serialno and banner fields) but
+     * other clients may populate those fields.
+     *
+     * We aren't checking amessage.data_length, under the assumption that
+     * a packet >= 30 bytes long will have "something" in the payload field.
+     */
+    return !memcmp(&p[0], "CNXN", 4) && !memcmp(&p[24], "host:", 5);
+}
+
 static int regex_probe(const char *p, int len, struct proto *proto)
 {
+#ifdef LIBPCRE
     regex_t **probe = proto->data;
     regmatch_t pos = { 0, len };
 
@@ -254,6 +302,11 @@ static int regex_probe(const char *p, int len, struct proto *proto)
         /* try them all */;
 
     return (*probe != NULL);
+#else
+    /* Should never happen as we check when loading config file */
+    fprintf(stderr, "FATAL: regex probe called but not built in\n");
+    exit(5);
+#endif
 }
 
 /* 
@@ -328,6 +381,15 @@ T_PROBE* get_probe(const char* description) {
      * regexp is not legal on the command line)*/
     if (!strcmp(description, "regex"))
         return regex_probe;
+
+    /* Special case of "sni" probe for same reason as above*/
+    if (!strcmp(description, "sni"))
+        return is_sni_protocol;
+
+    /* Special case of "timeout" is allowed as a probe name in the
+     * configuration file even though it's not really a probe */
+    if (!strcmp(description, "timeout"))
+        return is_true;
 
     return NULL;
 }
