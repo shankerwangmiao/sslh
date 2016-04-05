@@ -21,8 +21,12 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#ifdef ENABLE_REGEX
 #ifdef LIBPCRE
+#include <pcreposix.h>
+#else
 #include <regex.h>
+#endif
 #endif
 #include <ctype.h>
 #include "probe.h"
@@ -43,18 +47,18 @@ static int is_true(const char *p, int len, struct proto* proto) { return 1; }
 /* Table of protocols that have a built-in probe
  */
 static struct proto builtins[] = {
-    /* description   service  saddr   probe  */
-    { "ssh1",        NULL,   NULL,   is_ssh1_protocol},
-    { "ssh2",        NULL,   NULL,   is_ssh2_protocol},
-    { "telnet",      NULL,   NULL,   is_telnet_protocol},
-    { "openvpn",     NULL,     NULL,   is_openvpn_protocol },
-    { "tinc",        NULL,     NULL,   is_tinc_protocol },
-    { "xmpp",        NULL,     NULL,   is_xmpp_protocol },
-    { "http",        NULL,     NULL,   is_http_protocol },
-    { "ssl",         NULL,     NULL,   is_tls_protocol },
-    { "tls",         NULL,     NULL,   is_tls_protocol },
-    { "adb",         NULL,     NULL,   is_adb_protocol },
-    { "anyprot",     NULL,     NULL,   is_true }
+    /* description   service  saddr  log_level  keepalive  probe  */
+    { "ssh2",         "sshd",   NULL,  1,        0,         is_ssh2_protocol},
+    { "ssh1",        NULL,     NULL,  1,        0,         is_ssh1_protocol },
+    { "telnet",      NULL,     NULL,  1,        0,         is_telnet_protocol },
+    { "openvpn",     NULL,     NULL,  1,        0,         is_openvpn_protocol },
+    { "tinc",        NULL,     NULL,  1,        0,         is_tinc_protocol },
+    { "xmpp",        NULL,     NULL,  1,        0,         is_xmpp_protocol },
+    { "http",        NULL,     NULL,  1,        0,         is_http_protocol },
+    { "ssl",         NULL,     NULL,  1,        0,         is_tls_protocol },
+    { "tls",         NULL,     NULL,  1,        0,         is_tls_protocol },
+    { "adb",         NULL,     NULL,  1,        0,         is_adb_protocol },
+    { "anyprot",     NULL,     NULL,  1,        0,         is_true }
 };
 
 static struct proto *protocols;
@@ -236,32 +240,17 @@ static int is_http_protocol(const char *p, int len, struct proto *proto)
     return PROBE_NEXT;
 }
 
-static int is_sni_protocol(const char *p, int len, struct proto *proto)
+static int is_sni_alpn_protocol(const char *p, int len, struct proto *proto)
 {
     int valid_tls;
-    char *hostname;
-    char **sni_hostname;
 
-    valid_tls = parse_tls_header(p, len, &hostname);
+    valid_tls = parse_tls_header(proto->data, p, len);
 
     if(valid_tls < 0)
         return -1 == valid_tls ? PROBE_AGAIN : PROBE_NEXT;
 
-    if (verbose) fprintf(stderr, "sni hostname: %s\n", hostname);
-
-    /* Assume does not match */
-    valid_tls = PROBE_NEXT;
-
-    for (sni_hostname = proto->data; *sni_hostname; sni_hostname++) {
-        fprintf(stderr, "matching [%s] with [%s]\n", hostname, *sni_hostname);
-        if(!strcmp(hostname, *sni_hostname)) {
-            valid_tls = PROBE_MATCH;
-            break;
-        }
-    }
-
-    free(hostname);
-    return valid_tls;
+    /* There *was* a valid match */
+    return PROBE_MATCH;
 }
 
 static int is_tls_protocol(const char *p, int len, struct proto *proto)
@@ -294,7 +283,7 @@ static int is_adb_protocol(const char *p, int len, struct proto *proto)
 
 static int regex_probe(const char *p, int len, struct proto *proto)
 {
-#ifdef LIBPCRE
+#ifdef ENABLE_REGEX
     regex_t **probe = proto->data;
     regmatch_t pos = { 0, len };
 
@@ -382,9 +371,9 @@ T_PROBE* get_probe(const char* description) {
     if (!strcmp(description, "regex"))
         return regex_probe;
 
-    /* Special case of "sni" probe for same reason as above*/
-    if (!strcmp(description, "sni"))
-        return is_sni_protocol;
+    /* Special case of "sni/alpn" probe for same reason as above*/
+    if (!strcmp(description, "sni_alpn"))
+        return is_sni_alpn_protocol;
 
     /* Special case of "timeout" is allowed as a probe name in the
      * configuration file even though it's not really a probe */

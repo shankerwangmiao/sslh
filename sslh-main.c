@@ -2,7 +2,7 @@
 # main: processing of config file, command line options and start the main
 # loop.
 #
-# Copyright (C) 2007-2014  Yves Rutschle
+# Copyright (C) 2007-2016  Yves Rutschle
 # 
 # This program is free software; you can redistribute it
 # and/or modify it under the terms of the GNU General Public
@@ -25,8 +25,12 @@
 #ifdef LIBCONFIG
 #include <libconfig.h>
 #endif
+#ifdef ENABLE_REGEX
 #ifdef LIBPCRE
+#include <pcreposix.h>
+#else
 #include <regex.h>
+#endif
 #endif
 
 #include "common.h"
@@ -119,16 +123,21 @@ static void printsettings(void)
     
     for (p = get_first_protocol(); p; p = p->next) {
         fprintf(stderr,
-                "%s addr: %s. libwrap service: %s family %d %d\n", 
+                "%s addr: %s. libwrap service: %s log_level: %d family %d %d [%s]\n", 
                 p->description, 
                 sprintaddr(buf, sizeof(buf), p->saddr), 
                 p->service,
+                p->log_level,
                 p->saddr->ai_family,
-                p->saddr->ai_addr->sa_family);
+                p->saddr->ai_addr->sa_family,
+                p->keepalive ? "keepalive" : "");
     }
     fprintf(stderr, "listening on:\n");
     for (a = addr_listen; a; a = a->ai_next) {
-        fprintf(stderr, "\t%s\n", sprintaddr(buf, sizeof(buf), a));
+        fprintf(stderr, 
+                "\t%s\t[%s]\n", 
+                sprintaddr(buf, sizeof(buf), a), 
+                a->ai_flags & SO_KEEPALIVE ? "keepalive" : "");
     }
     fprintf(stderr, "timeout: %d\non-timeout: %s\n", probing_timeout,
             timeout_protocol()->description);
@@ -142,7 +151,7 @@ static void printsettings(void)
 static int config_listen(config_t *config, struct addrinfo **listen) 
 {
     config_setting_t *setting, *addr;
-    int len, i;
+    int len, i, keepalive;
     const char *hostname, *port;
 
     setting = config_lookup(config, "listen");
@@ -158,12 +167,20 @@ static int config_listen(config_t *config, struct addrinfo **listen)
                 return -1;
             }
 
+            keepalive = 0;
+            config_setting_lookup_bool(addr, "keepalive", &keepalive);
+
             resolve_split_name(listen, hostname, port);
 
             /* getaddrinfo returned a list of addresses corresponding to the
              * specification; move the pointer to the end of that list before
-             * processing the next specification */
-            for (; *listen; listen = &((*listen)->ai_next));
+             * processing the next specification, while setting flags for
+             * start_listen_sockets() through ai_flags (which is not meant for
+             * that, but is only used as hint in getaddrinfo, so it's OK) */
+            for (; *listen; listen = &((*listen)->ai_next)) {
+                if (keepalive)
+                    (*listen)->ai_flags = SO_KEEPALIVE;
+            }
         }
     }
 
@@ -176,7 +193,7 @@ static int config_listen(config_t *config, struct addrinfo **listen)
 #ifdef LIBCONFIG
 static void setup_regex_probe(struct proto *p, config_setting_t* probes)
 {
-#ifdef LIBPCRE
+#ifdef ENABLE_REGEX
     int num_probes, errsize, i, res;
     char *err;
     const char * expr;
@@ -212,34 +229,47 @@ static void setup_regex_probe(struct proto *p, config_setting_t* probes)
 #endif
 
 #ifdef LIBCONFIG
-static void setup_sni_hostnames(struct proto *p, config_setting_t* sni_hostnames)
+static void setup_sni_alpn_list(struct proto *p, config_setting_t* config_items, const char* name, int alpn)
 {
     int num_probes, i, max_server_name_len, server_name_len;
-    const char * sni_hostname;
+    const char * config_item;
     char** sni_hostname_list;
 
-    num_probes = config_setting_length(sni_hostnames);
+    if(!config_items || !config_setting_is_array(config_items)) {
+        fprintf(stderr, "%s: no %s specified\n", p->description, name);
+        return;
+    }
+    num_probes = config_setting_length(config_items);
     if (!num_probes) {
-        fprintf(stderr, "%s: no sni_hostnames specified\n", p->description);
-        exit(1);
+        fprintf(stderr, "%s: no %s specified\n", p->description, name);
+        return;
     }
 
     max_server_name_len = 0;
     for (i = 0; i < num_probes; i++) {
-        server_name_len = strlen(config_setting_get_string_elem(sni_hostnames, i));
+        server_name_len = strlen(config_setting_get_string_elem(config_items, i));
         if(server_name_len > max_server_name_len)
             max_server_name_len = server_name_len;
     }
 
     sni_hostname_list = calloc(num_probes + 1, ++max_server_name_len);
-    p->data = (void*)sni_hostname_list;
 
     for (i = 0; i < num_probes; i++) {
-        sni_hostname = config_setting_get_string_elem(sni_hostnames, i);
+        config_item = config_setting_get_string_elem(config_items, i);
         sni_hostname_list[i] = malloc(max_server_name_len);
-        strcpy (sni_hostname_list[i], sni_hostname);
-        if(verbose) fprintf(stderr, "sni_hostnames[%d]: %s\n", i, sni_hostname_list[i]);
+        strcpy (sni_hostname_list[i], config_item);
+        if(verbose) fprintf(stderr, "%s: %s[%d]: %s\n", p->description, name, i, sni_hostname_list[i]);
     }
+
+    p->data = (void*)tls_data_set_list(p->data, alpn, sni_hostname_list);
+}
+
+static void setup_sni_alpn(struct proto *p, config_setting_t* sni_hostnames, config_setting_t* alpn_protocols)
+{
+    p->data = (void*)new_tls_data();
+    p->probe = get_probe("sni_alpn");
+    setup_sni_alpn_list(p, sni_hostnames, "sni_hostnames", 0);
+    setup_sni_alpn_list(p, alpn_protocols, "alpn_protocols", 1);
 }
 #endif
 
@@ -249,7 +279,7 @@ static void setup_sni_hostnames(struct proto *p, config_setting_t* sni_hostnames
 #ifdef LIBCONFIG
 static int config_protocols(config_t *config, struct proto **prots)
 {
-    config_setting_t *setting, *prot, *patterns, *sni_hostnames;
+    config_setting_t *setting, *prot, *patterns, *sni_hostnames, *alpn_protocols;
     const char *hostname, *port, *name;
     int i, num_prots;
     struct proto *p, *prev = NULL;
@@ -270,11 +300,16 @@ static int config_protocols(config_t *config, struct proto **prots)
                 )) {
                 p->description = name;
                 config_setting_lookup_string(prot, "service", &(p->service));
+                config_setting_lookup_bool(prot, "keepalive", &p->keepalive);
+
+                if (config_setting_lookup_int(prot, "log_level", &p->log_level) == CONFIG_FALSE) {
+                    p->log_level = 1;
+                }
 
                 resolve_split_name(&(p->saddr), hostname, port);
 
                 p->probe = get_probe(name);
-                if (!p->probe) {
+                if (!p->probe || !strcmp(name, "sni_alpn")) {
                     fprintf(stderr, "line %d: %s: probe unknown\n", config_setting_source_line(prot), name);
                     exit(1);
                 }
@@ -287,13 +322,16 @@ static int config_protocols(config_t *config, struct proto **prots)
                     }
                 }
 
-                /* Probe-specific options: SNI hostnames */
-                if (!strcmp(name, "sni")) {
+                /* Probe-specific options: SNI/ALPN */
+                if (!strcmp(name, "tls")) {
                     sni_hostnames = config_setting_get_member(prot, "sni_hostnames");
-                    if (sni_hostnames && config_setting_is_array(sni_hostnames)) {
-                        setup_sni_hostnames(p, sni_hostnames);
+                    alpn_protocols = config_setting_get_member(prot, "alpn_protocols");
+
+                    if((sni_hostnames && config_setting_is_array(sni_hostnames)) || (alpn_protocols && config_setting_is_array(alpn_protocols))) {
+                        setup_sni_alpn(p, sni_hostnames, alpn_protocols);
                     }
                 }
+
             }
         }
     }
@@ -526,10 +564,13 @@ next_arg:
 
     set_protocol_list(prots);
 
+/* If compiling with systemd socket support no need to require listen address */
+#ifndef SYSTEMD
     if (!addr_listen && !inetd) {
         fprintf(stderr, "No listening address specified; use at least one -p option\n");
         exit(1);
     }
+#endif
 
     /* Did command-line override foreground setting? */
     if (background)
@@ -565,6 +606,13 @@ int main(int argc, char *argv[])
        printsettings();
 
    num_addr_listen = start_listen_sockets(&listen_sockets, addr_listen);
+
+#ifdef SYSTEMD
+   if (num_addr_listen < 1) {
+     fprintf(stderr, "No listening sockets found, restart sockets or specify addresses in config\n");
+     exit(1);
+    }
+#endif
 
    if (!foreground) {
        if (fork() > 0) exit(0); /* Detach */
